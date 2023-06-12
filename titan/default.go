@@ -52,24 +52,16 @@ func defaultTLSConf() *tls.Config {
 
 func defaultQUICConfig() *quic.Config {
 	return &quic.Config{
-		KeepAlivePeriod: time.Second,
+		KeepAlivePeriod: 30 * time.Second,
+		MaxIdleTimeout:  30 * time.Second,
+		Allow0RTT:       func(net.Addr) bool { return true },
 	}
 }
 
-func defaultHttpClient(conn net.PacketConn) *http.Client {
-	tlsConf := &tls.Config{
-		MinVersion:         tls.VersionTLS12,
-		InsecureSkipVerify: true,
-		NextProtos:         []string{http3.NextProtoH3},
-	}
-
-	conf := &quic.Config{
-		KeepAlivePeriod: time.Second,
-	}
-
+func defaultHttpClient(conn net.PacketConn, timeout time.Duration) *http.Client {
 	return &http.Client{Transport: &http3.RoundTripper{
-		TLSClientConfig: tlsConf,
-		QuicConfig:      conf,
+		TLSClientConfig: defaultTLSConf(),
+		QuicConfig:      defaultQUICConfig(),
 		Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (quic.EarlyConnection, error) {
 			address, err := net.ResolveUDPAddr("udp", addr)
 			if err != nil {
@@ -77,27 +69,25 @@ func defaultHttpClient(conn net.PacketConn) *http.Client {
 			}
 			return quic.DialEarlyContext(ctx, conn, address, "localhost", tlsCfg, cfg)
 		},
-	}}
-}
-
-func newHttpClient(conn quic.EarlyConnection, timeout time.Duration) *http.Client {
-	return &http.Client{Transport: &http3.RoundTripper{
-		TLSClientConfig: defaultTLSConf(),
-		QuicConfig:      defaultQUICConfig(),
-		Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (quic.EarlyConnection, error) {
-			return conn, nil
-		},
 	}, Timeout: timeout}
 }
 
-func createConnection(ctx context.Context, conn net.PacketConn, remoteAddr string) (quic.EarlyConnection, error) {
+func newHttp3Client(ctx context.Context, conn net.PacketConn, remoteAddr string, timeout time.Duration) (*http.Client, error) {
 	addr, err := net.ResolveUDPAddr("udp", remoteAddr)
 	if err != nil {
 		return nil, err
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, defaultTimout)
-	defer cancel()
+	earlyConn, err := quic.DialEarlyContext(ctx, conn, addr, "localhost", defaultTLSConf(), defaultQUICConfig())
+	if err != nil {
+		return nil, err
+	}
 
-	return quic.DialEarlyContext(ctx, conn, addr, "localhost", defaultTLSConf(), defaultQUICConfig())
+	return &http.Client{Transport: &http3.RoundTripper{
+		TLSClientConfig: defaultTLSConf(),
+		QuicConfig:      defaultQUICConfig(),
+		Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (quic.EarlyConnection, error) {
+			return earlyConn, nil
+		},
+	}, Timeout: timeout}, nil
 }

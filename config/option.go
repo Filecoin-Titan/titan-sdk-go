@@ -16,21 +16,20 @@ const (
 )
 
 const (
-	defaultListenAddr             = ":8863"
-	defaultRangeConcurrency       = 10
-	defaultRangeSize        int64 = 1 << 20 // 1 MiB
+	defaultListenAddr       = ":0"
+	defaultRangeSize  int64 = 2 << 20 // 2 MiB
 )
 
 // Config is a set of titan SDK options.
 type Config struct {
-	ListenAddr  string
-	Address     string
-	Token       string
-	HttpClient  *http.Client
-	Timeout     time.Duration
-	Mode        TraversalMode
-	Concurrency int   // for range mode
-	RangeSize   int64 // for range mode
+	ListenAddr string
+	Address    string
+	Token      string
+	HttpClient *http.Client
+	Timeout    time.Duration
+	Mode       TraversalMode
+	RangeSize  int64 // for range mode
+	Verbose    bool
 }
 
 // Option is a single titan sdk Config.
@@ -39,11 +38,11 @@ type Option func(opts *Config)
 // DefaultOption returns a default set of options.
 func DefaultOption() Config {
 	return Config{
-		Mode:        TraversalModeDFS,
-		ListenAddr:  defaultListenAddr,
-		Concurrency: defaultRangeConcurrency,
-		RangeSize:   defaultRangeSize,
-		Timeout:     30 * time.Second,
+		Mode:       TraversalModeDFS,
+		ListenAddr: defaultListenAddr,
+		RangeSize:  defaultRangeSize,
+		Timeout:    5 * time.Second,
+		Verbose:    false,
 	}
 }
 
@@ -68,7 +67,7 @@ func Http3ClientOption(client *http.Client) Option {
 	}
 }
 
-// TraversalModeOption set the download file traversal algorithm, default using DFS pre-order walk algorithm for Dag.
+// TraversalModeOption set the download file traversal algorithm, default using DFS pre-order walk algorithm for dag.
 func TraversalModeOption(mode TraversalMode) Option {
 	return func(opts *Config) {
 		opts.Mode = mode
@@ -79,15 +78,6 @@ func TraversalModeOption(mode TraversalMode) Option {
 func ListenAddressOption(addr string) Option {
 	return func(opts *Config) {
 		opts.ListenAddr = addr
-	}
-}
-
-// RangeConcurrencyOption limits the maximum number of concurrency HTTP requests allowed at the same time.
-//
-// This option only works when using `TraversalModeRange` to download files.
-func RangeConcurrencyOption(concurrency int) Option {
-	return func(opts *Config) {
-		opts.Concurrency = concurrency
 	}
 }
 
@@ -109,5 +99,12 @@ func RangeSizeOption(size int64) Option {
 func TimeoutOption(timeout time.Duration) Option {
 	return func(opts *Config) {
 		opts.Timeout = timeout
+	}
+}
+
+// VerboseOption Make the operation more talkative
+func VerboseOption(verbose bool) Option {
+	return func(opts *Config) {
+		opts.Verbose = verbose
 	}
 }

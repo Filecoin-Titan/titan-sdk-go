@@ -2,28 +2,34 @@ package byterange
 
 import (
 	"context"
+	"fmt"
 	"github.com/Filecoin-Titan/titan-sdk-go/titan"
+	"github.com/Filecoin-Titan/titan-sdk-go/types"
 	"github.com/eikenb/pipeat"
 	"github.com/ipfs/go-cid"
 	"github.com/pkg/errors"
 	"math"
+	"math/rand"
+	"time"
 )
 
 type dispatcher struct {
-	cid         cid.Cid
-	fileSize    int64
-	rangeSize   int64
-	concurrency int
-	todos       JobQueue
-	workers     chan worker
-	resp        chan response
-	titan       *titan.Service
-	writer      *pipeat.PipeWriterAt
-	reader      *pipeat.PipeReaderAt
+	cid       cid.Cid
+	fileSize  int64
+	rangeSize int64
+	todos     JobQueue
+	workers   chan worker
+	resp      chan response
+	titan     *titan.Service
+	writer    *pipeat.PipeWriterAt
+	reader    *pipeat.PipeReaderAt
+	clients   map[string]*types.Client
+	backoff   *backoff
 }
 
 type worker struct {
 	id int
+	c  *types.Client
 }
 
 type response struct {
@@ -38,9 +44,31 @@ type job struct {
 	retry int
 }
 
+type backoff struct {
+	minDelay time.Duration
+	maxDelay time.Duration
+}
+
+func (b *backoff) next(attempt int) time.Duration {
+	if attempt < 0 {
+		return b.minDelay
+	}
+
+	minf := float64(b.minDelay)
+	durf := minf * math.Pow(1.5, float64(attempt))
+	durf = durf + rand.Float64()*minf
+
+	delay := time.Duration(durf)
+	if delay > b.maxDelay {
+		return b.maxDelay
+	}
+
+	return delay
+}
+
 func (d *dispatcher) initialization() {
-	for i := 0; i < d.concurrency; i++ {
-		d.workers <- worker{id: i}
+	for _, client := range d.clients {
+		d.workers <- worker{c: client}
 	}
 
 	count := int64(math.Ceil(float64(d.fileSize) / float64(d.rangeSize)))
@@ -80,20 +108,17 @@ func (d *dispatcher) run(ctx context.Context) {
 						return
 					}
 
-					if j.retry > 0 {
-						log.Debugf("pull data (retries: %d)", j.retry)
-					}
-
-					data, err := d.fetch(ctx, d.cid, j.start, j.end)
+					data, err := d.fetch(ctx, w.c, d.cid, j.start, j.end)
 					if err != nil {
-						log.Errorf("pull data failed: %v", err)
-
-						if j.retry < 3 {
-							j.retry++
-						} else {
-							// TODO: maybe remove bad nodes
+						errMsg := fmt.Sprintf("pull data failed : %v", err)
+						if j.retry > 0 {
+							log.Debugf("pull data failed (retries: %d): %v", j.retry, err)
+							<-time.After(d.backoff.next(j.retry))
 						}
 
+						log.Warnf(errMsg)
+
+						j.retry++
 						d.todos.PushFront(j)
 						d.workers <- w
 						return
@@ -155,8 +180,8 @@ func (d *dispatcher) writeData(ctx context.Context) {
 	}()
 }
 
-func (d *dispatcher) fetch(ctx context.Context, cid cid.Cid, start, end int64) ([]byte, error) {
-	_, data, err := d.titan.GetRange(ctx, cid, start, end)
+func (d *dispatcher) fetch(ctx context.Context, c *types.Client, cid cid.Cid, start, end int64) ([]byte, error) {
+	_, data, err := d.titan.GetRange(ctx, c, cid, start, end)
 	if err != nil {
 		return nil, errors.Errorf("get range failed: %v", err)
 	}

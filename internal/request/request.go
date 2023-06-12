@@ -44,20 +44,14 @@ func PostJsonRPC(client *http.Client, url string, in Request, requestHeader http
 }
 
 func NewRequest(ctx context.Context, url, namespace string, header http.Header) *request {
-	if !strings.HasPrefix(url, "https") {
+	if !strings.HasPrefix(url, "http") {
 		url = "https://" + url
-	}
-
-	opts := map[string]string{
-		"encoding":        "json",
-		"stream-channels": "true",
 	}
 
 	return &request{
 		Ctx:       ctx,
 		ApiBase:   url,
 		Namespace: namespace,
-		Opts:      opts,
 		Headers:   header,
 	}
 }
