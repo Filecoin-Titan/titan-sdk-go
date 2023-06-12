@@ -2,6 +2,7 @@ package types
 
 import (
 	"fmt"
+	"net/http"
 	"time"
 )
 
@@ -86,10 +87,15 @@ func (e Edge) GetNATType() NATType {
 	}
 }
 
+type Client struct {
+	Node       *Edge
+	Weight     int
+	HttpClient *http.Client
+}
+
 type NatPunchReq struct {
-	Tk     *Token
-	NodeID string
-	// seconds
+	Tk      *Token
+	NodeID  string
 	Timeout time.Duration
 }
 
@@ -121,7 +127,7 @@ type FileRange struct {
 }
 
 type Workload struct {
-	DownloadSpeed int64
+	DownloadSpeed int64 // bytes/ms
 	DownloadSize  int64
 	StartTime     int64
 	EndTime       int64
@@ -132,4 +138,17 @@ type WorkloadReport struct {
 	ClientID string
 	NodeID   string
 	Workload *Workload
+	Extra    *Extra `json:"-"`
+}
+
+type ProofParam struct {
+	Proofs       *WorkloadReport
+	SchedulerKey string
+	SchedulerURL string
+}
+
+type Extra struct {
+	Cost    int64 //ms
+	Count   int64
+	Address string
 }

@@ -10,58 +10,51 @@ import (
 	"github.com/Filecoin-Titan/titan-sdk-go/internal/crypto"
 	"github.com/Filecoin-Titan/titan-sdk-go/internal/request"
 	"github.com/Filecoin-Titan/titan-sdk-go/types"
+	"github.com/docker/go-units"
 	"github.com/gorilla/mux"
 	blocks "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 	logging "github.com/ipfs/go-log"
+	"github.com/olekukonko/tablewriter"
 	"github.com/pkg/errors"
 	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/sync/errgroup"
 	"io"
-	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 var (
-	defaultTimout = 3 * time.Second
-
 	formatRaw = "raw"
 	formatCAR = "car"
+	namespace = "ipfs"
 )
 
 var log = logging.Logger("service")
 
 type Service struct {
-	baseAPI    string
-	token      string
+	opts       config.Config
 	httpClient *http.Client
-	timeout    time.Duration
+	conn       net.PacketConn
+	mineNat    types.NATType
+	ids        sync.Map
+	counter    atomic.Int32
 
-	conn            net.PacketConn
-	natType         types.NATType
-	accessibleEdges []*types.Edge
-
-	count   int
-	started bool
+	prepareChan chan *types.ProofParam
+	submitChan  chan struct{}
 
 	clk     sync.Mutex
-	clients map[string]*http.Client // holds the connection between user side and edge node
-
-	plk    sync.Mutex
-	proofs map[string]*proofParam
-}
-
-type proofParam struct {
-	Proofs       *types.WorkloadReport
-	SchedulerKey string
-	SchedulerURL string
+	clients map[string]*types.Client
+	nodes   []*types.Edge
 }
 
 type params []interface{}
@@ -77,21 +70,24 @@ func New(options config.Config) (*Service, error) {
 	}
 
 	s := &Service{
-		baseAPI:    getRpcV0URL(options.Address),
-		token:      options.Token,
-		httpClient: defaultHttpClient(conn),
-		timeout:    options.Timeout,
-		count:      rand.Intn(100),
-		conn:       conn,
-		started:    false,
-		clients:    make(map[string]*http.Client),
-		proofs:     make(map[string]*proofParam),
+		opts:        options,
+		httpClient:  defaultHttpClient(conn, options.Timeout),
+		conn:        conn,
+		clients:     make(map[string]*types.Client),
+		nodes:       make([]*types.Edge, 0),
+		prepareChan: make(chan *types.ProofParam, 1),
+		submitChan:  make(chan struct{}, 0),
 	}
 
 	go serverHTTP(conn)
 	go serverTCP(conn)
+	go s.handleProofs()
 
 	return s, nil
+}
+
+func (s *Service) Close() error {
+	return s.conn.Close()
 }
 
 func getRpcV0URL(baseURL string) string {
@@ -129,6 +125,13 @@ func serverTCP(conn net.PacketConn) {
 	srv.Serve(ln)
 }
 
+func (s *Service) GetClient(nodeID string) *http.Client {
+	s.clk.Lock()
+	defer s.clk.Unlock()
+
+	return s.clients[nodeID].HttpClient
+}
+
 // GetBlock retrieves a raw block from titan http gateway
 func (s *Service) GetBlock(ctx context.Context, cid cid.Cid) (blocks.Block, error) {
 	err := s.loadEdges(ctx, cid)
@@ -142,16 +145,15 @@ func (s *Service) GetBlock(ctx context.Context, cid cid.Cid) (blocks.Block, erro
 	}
 
 	start := time.Now()
-	namespace := fmt.Sprintf("ipfs/%s", cid.String())
-	size, data, err := getData(client, edge, namespace, formatRaw, nil)
+	size, data, err := PullData(ctx, client, edge, cid.String(), formatRaw, nil)
 	if err != nil {
 		return nil, errors.Errorf("post request failed: %v", err)
 	}
 
 	proofs := &proofOfWorkParams{
 		cid:    cid,
-		tStart: start,
-		tEnd:   time.Now(),
+		tStart: start.UnixMilli(),
+		tEnd:   time.Now().UnixMilli(),
 		size:   size,
 		edge:   edge,
 	}
@@ -164,37 +166,73 @@ func (s *Service) GetBlock(ctx context.Context, cid cid.Cid) (blocks.Block, erro
 }
 
 func (s *Service) selectEdge() (*types.Edge, *http.Client, error) {
-	if len(s.accessibleEdges) == 0 {
-		return nil, nil, errors.Errorf("no avaliable node")
+	if len(s.clients) == 0 {
+		return nil, nil, errors.Errorf("no accessible node")
 	}
 
-	luckyEdge := s.roundRobin()
+	luckyEdge := roundRobinSelector(s.filterBadNodes())()
+	if luckyEdge == nil {
+		return nil, nil, errors.Errorf("unavaliable node")
+	}
 
-	s.clk.Lock()
-	client := s.clients[luckyEdge.NodeID]
-	s.clk.Unlock()
-
-	return luckyEdge, client, nil
+	return luckyEdge, s.GetClient(luckyEdge.NodeID), nil
 }
 
-func getData(client *http.Client, edge *types.Edge, namespace string, format string, requestHeader http.Header) (int64, []byte, error) {
+func (s *Service) filterBadNodes() []*types.Edge {
+	s.counter.Add(1)
+
+	counter := int(s.counter.Load())
+	cutoff := counter % len(s.clients)
+
+	if cutoff == 0 {
+		var clients []*types.Client
+		for _, client := range s.clients {
+			if client.Weight <= 0 {
+				continue
+			}
+
+			clients = append(clients, client)
+		}
+
+		sort.Slice(clients, func(i, j int) bool {
+			return clients[i].Weight > clients[j].Weight
+		})
+
+		var nodes []*types.Edge
+		for _, client := range clients {
+			nodes = append(nodes, client.Node)
+		}
+
+		s.nodes = nodes
+	}
+
+	round := counter / len(s.nodes)
+
+	half := len(s.nodes) / 2
+	end := len(s.nodes) - round
+	if end < half {
+		end = half
+	}
+
+	return s.nodes[:end]
+}
+
+func PullData(ctx context.Context, client *http.Client, edge *types.Edge, cid string, format string, requestHeader http.Header) (int64, []byte, error) {
+	startTime := time.Now()
+
 	body, err := codec.Encode(edge.Token)
 	if err != nil {
 		return 0, nil, errors.Errorf("send request: %v", err)
 	}
 
-	resp, err := request.NewBuilder(client, edge.Address, namespace, requestHeader).
+	ns := namespace + "/" + cid
+	resp, err := request.NewBuilder(client, edge.Address, ns, requestHeader).
 		Option("format", format).
-		BodyBytes(body).Get(context.Background())
+		BodyBytes(body).Get(ctx)
 	if err != nil {
 		return 0, nil, errors.Errorf("send request: %v", err)
 	}
-
 	defer resp.Close()
-
-	if resp.Error != nil {
-		return 0, nil, resp.Error
-	}
 
 	data, err := io.ReadAll(resp.Output)
 	if err != nil {
@@ -210,6 +248,8 @@ func getData(client *http.Client, edge *types.Edge, namespace string, format str
 		}
 	}
 
+	log.Debugf("pulling data from %s(%s) speed: %s/s", edge.NodeID, edge.Address, units.BytesSize(float64(len(data))/time.Since(startTime).Seconds()))
+
 	return size, data, nil
 }
 
@@ -224,13 +264,12 @@ func getFileSizeFromContentRange(contentRange string) (int64, error) {
 
 // loadEdges retrieves all accessible edge nodes of a file
 func (s *Service) loadEdges(ctx context.Context, cid cid.Cid) error {
-	if s.started {
+	_, ok := s.ids.Load(cid.String())
+	if ok {
 		return nil
 	}
 
-	s.started = true
-
-	edges, err := s.getEdgeNodesByFile(cid)
+	edges, err := s.GetAccessibleEdges(ctx, cid)
 	if err != nil {
 		return err
 	}
@@ -239,38 +278,59 @@ func (s *Service) loadEdges(ctx context.Context, cid cid.Cid) error {
 		return errors.Errorf("no edge node found for cid: %s", cid.String())
 	}
 
-	return s.filterAccessibleEdges(ctx, edges)
+	s.ids.Store(cid.String(), true)
+
+	return nil
+}
+
+func (s *Service) GetAccessibleEdges(ctx context.Context, cid cid.Cid) (map[string]*types.Client, error) {
+	all, err := s.GetEdgeNodesByFile(cid)
+	if err != nil {
+		return nil, err
+	}
+
+	clients, err := s.accessibleNodes(ctx, all)
+	if err != nil {
+		return nil, err
+	}
+
+	if err = s.updateClients(clients); err != nil {
+		return nil, err
+	}
+
+	return clients, nil
+}
+
+func (s *Service) updateClients(clients map[string]*types.Client) error {
+	nodes := make([]*types.Edge, 0, len(clients))
+	for _, c := range clients {
+		nodes = append(nodes, c.Node)
+	}
+
+	s.clk.Lock()
+	s.clients = clients
+	s.nodes = nodes
+	s.clk.Unlock()
+
+	return nil
 }
 
 // GetRange retrieves specific byte ranges of UnixFS files and raw blocks.
-func (s *Service) GetRange(ctx context.Context, cid cid.Cid, start, end int64) (int64, []byte, error) {
-	err := s.loadEdges(ctx, cid)
-	if err != nil {
-		return 0, nil, err
-	}
-
-	edge, client, err := s.selectEdge()
-	if err != nil {
-		return 0, nil, err
-	}
-
+func (s *Service) GetRange(ctx context.Context, c *types.Client, cid cid.Cid, start, end int64) (int64, []byte, error) {
 	startTime := time.Now()
-	namespace := fmt.Sprintf("ipfs/%s", cid.String())
 	header := http.Header{}
 	header.Add("Range", fmt.Sprintf("bytes=%d-%d", start, end))
-
-	log.Debugf("pull data from: %s", edge.Address)
-	size, data, err := getData(client, edge, namespace, formatCAR, header)
+	size, data, err := PullData(ctx, c.HttpClient, c.Node, cid.String(), formatCAR, header)
 	if err != nil {
-		return 0, nil, errors.Errorf("post request failed: %v", err)
+		return 0, nil, errors.Errorf("post request failed, ip: %s, err: %v", c.Node.Address, err)
 	}
 
 	proofs := &proofOfWorkParams{
 		cid:    cid,
-		tStart: startTime,
-		tEnd:   time.Now(),
-		size:   size,
-		edge:   edge,
+		tStart: startTime.UnixMilli(),
+		tEnd:   time.Now().UnixMilli(),
+		size:   int64(len(data)),
+		edge:   c.Node,
 		rStart: start,
 		rEnd:   end,
 	}
@@ -279,17 +339,18 @@ func (s *Service) GetRange(ctx context.Context, cid cid.Cid, start, end int64) (
 		return 0, nil, errors.Errorf("generate proof of work failed: %v", err)
 	}
 
-	return size, data, nil
-}
+	speed := len(data) / int(proofs.tEnd-proofs.tStart)
+	s.clk.Lock()
+	s.clients[c.Node.NodeID].Weight = speed / 1000
+	s.clk.Unlock()
 
-func (s *Service) EdgeSize() int {
-	return len(s.accessibleEdges)
+	return size, data, nil
 }
 
 type proofOfWorkParams struct {
 	cid    cid.Cid
-	tStart time.Time
-	tEnd   time.Time
+	tStart int64
+	tEnd   int64
 	size   int64
 	edge   *types.Edge
 	rStart int64
@@ -298,47 +359,28 @@ type proofOfWorkParams struct {
 
 // generateProofOfWork generates proofs of work for per request.
 func (s *Service) generateProofOfWork(params *proofOfWorkParams) error {
-	cost := params.tEnd.Sub(params.tStart)
-	speed := params.size / int64(cost)
-	url := params.edge.SchedulerURL
-	key := params.edge.SchedulerKey
-
-	newProof := &proofParam{
+	s.prepareChan <- &types.ProofParam{
 		Proofs: &types.WorkloadReport{
 			TokenID: params.edge.Token.ID,
 			NodeID:  params.edge.NodeID,
 			Workload: &types.Workload{
-				StartTime:     params.tStart.Unix(),
-				EndTime:       params.tEnd.Unix(),
-				DownloadSpeed: speed,
-				DownloadSize:  params.size,
+				StartTime:    params.tStart,
+				EndTime:      params.tEnd,
+				DownloadSize: params.size,
+			},
+			Extra: &types.Extra{
+				Cost:    params.tEnd - params.tStart,
+				Count:   1,
+				Address: params.edge.Address,
 			},
 		},
-		SchedulerURL: url,
-		SchedulerKey: key,
+		SchedulerURL: params.edge.SchedulerURL,
+		SchedulerKey: params.edge.SchedulerKey,
 	}
-
-	s.plk.Lock()
-
-	prev, ok := s.proofs[params.edge.Token.ID]
-	if ok {
-		prevWorkload := prev.Proofs.Workload
-		newWorkload := newProof.Proofs.Workload
-		newProof.Proofs.Workload = &types.Workload{
-			StartTime:     prevWorkload.StartTime,
-			EndTime:       newWorkload.EndTime,
-			DownloadSpeed: (prevWorkload.DownloadSpeed + newWorkload.DownloadSpeed) / 2,
-			DownloadSize:  prevWorkload.DownloadSize + newWorkload.DownloadSize,
-		}
-	}
-
-	s.proofs[params.edge.Token.ID] = newProof
-	s.plk.Unlock()
-
 	return nil
 }
 
-func (s *Service) getEdgeNodesByFile(cid cid.Cid) ([]*types.Edge, error) {
+func (s *Service) GetEdgeNodesByFile(cid cid.Cid) ([]*types.Edge, error) {
 	serializedParams, err := json.Marshal(params{cid.String()})
 	if err != nil {
 		return nil, errors.Errorf("marshaling params failed: %v", err)
@@ -352,10 +394,10 @@ func (s *Service) getEdgeNodesByFile(cid cid.Cid) ([]*types.Edge, error) {
 	}
 
 	header := http.Header{}
-	if s.token != "" {
-		header.Add("Authorization", "Bearer "+s.token)
+	if s.opts.Token != "" {
+		header.Add("Authorization", "Bearer "+s.opts.Token)
 	}
-	data, err := request.PostJsonRPC(s.httpClient, s.baseAPI, req, header)
+	data, err := request.PostJsonRPC(s.httpClient, getRpcV0URL(s.opts.Address), req, header)
 	if err != nil {
 		return nil, errors.Errorf("post jsonrpc failed: %v", err)
 	}
@@ -376,7 +418,7 @@ func (s *Service) getEdgeNodesByFile(cid cid.Cid) ([]*types.Edge, error) {
 				SchedulerURL: item.SchedulerURL,
 				SchedulerKey: item.SchedulerKey,
 			}
-			log.Debugf("edge node id: %s, ip: %s, NAT: %s", e.NodeID, e.Address, e.NATType)
+			log.Debugf("edge node id: %s(%s) NAT: %s", e.NodeID, e.Address, e.NATType)
 			out = append(out, e)
 		}
 	}
@@ -399,10 +441,10 @@ func (s *Service) GetSchedulers() ([]string, error) {
 	}
 
 	header := http.Header{}
-	if s.token != "" {
-		header.Add("Authorization", "Bearer "+s.token)
+	if s.opts.Token != "" {
+		header.Add("Authorization", "Bearer "+s.opts.Token)
 	}
-	data, err := request.PostJsonRPC(s.httpClient, s.baseAPI, req, header)
+	data, err := request.PostJsonRPC(s.httpClient, getRpcV0URL(s.opts.Address), req, header)
 	if err != nil {
 		return nil, err
 	}
@@ -577,55 +619,9 @@ func getPushURL(addr string) (string, error) {
 	return pushURL.String(), nil
 }
 
-// roundRobin is a round-robin strategy algorithm for node selection.
-func (s *Service) roundRobin() *types.Edge {
-	s.clk.Lock()
-	defer s.clk.Unlock()
-
-	s.count++
-	return s.accessibleEdges[s.count%len(s.accessibleEdges)]
-}
-
-func (s *Service) cleanup() {
-	s.started = false
-	s.accessibleEdges = nil
-	s.clients = make(map[string]*http.Client)
-	s.proofs = make(map[string]*proofParam)
-}
-
 func (s *Service) EndOfFile() error {
-	defer s.cleanup()
-
-	s.plk.Lock()
-	keyInScheduler := make(map[string]string)
-	schedulerGroup := make(map[string][]*types.WorkloadReport)
-	for _, param := range s.proofs {
-		_, ok := schedulerGroup[param.SchedulerURL]
-		if !ok {
-			schedulerGroup[param.SchedulerURL] = make([]*types.WorkloadReport, 0)
-		}
-		keyInScheduler[param.SchedulerURL] = param.SchedulerKey
-		schedulerGroup[param.SchedulerURL] = append(schedulerGroup[param.SchedulerURL], param.Proofs)
-	}
-	s.plk.Unlock()
-
-	var eg errgroup.Group
-	for url, paramList := range schedulerGroup {
-		if len(paramList) == 0 {
-			continue
-		}
-
-		eg.Go(func() error {
-			key := keyInScheduler[url]
-			data, err := encrypt(key, paramList)
-			if err != nil {
-				return errors.Errorf("encrypting proof failed: %v", err)
-			}
-
-			return s.SubmitProofOfWork(url, data)
-		})
-	}
-	return eg.Wait()
+	s.submitChan <- struct{}{}
+	return nil
 }
 
 func encrypt(key string, value interface{}) ([]byte, error) {
@@ -640,4 +636,80 @@ func encrypt(key string, value interface{}) ([]byte, error) {
 	}
 
 	return crypto.Encrypt(data, pub)
+}
+
+func printReport(proofs map[string]*types.ProofParam) {
+	table := tablewriter.NewWriter(os.Stdout)
+	table.SetHeader([]string{"NodeID", "Address", "Speed", "Count", "DataSize"})
+
+	for _, item := range proofs {
+		speed := fmt.Sprintf("%s/s", units.BytesSize(float64(item.Proofs.Workload.DownloadSpeed)))
+		size := units.BytesSize(float64(item.Proofs.Workload.DownloadSize))
+		count := strconv.Itoa(int(item.Proofs.Extra.Count))
+		table.Append([]string{item.Proofs.NodeID, item.Proofs.Extra.Address, speed, count, size})
+	}
+
+	table.Render()
+}
+
+func (s *Service) handleProofs() error {
+	proofs := make(map[string]*types.ProofParam)
+
+	for {
+		select {
+		case in := <-s.prepareChan:
+			prevNodeId := in.Proofs.NodeID
+			old, ok := proofs[prevNodeId]
+			if ok {
+				prevWorkload := old.Proofs.Workload
+				newWorkload := in.Proofs.Workload
+				in.Proofs.Workload = &types.Workload{
+					StartTime:    prevWorkload.StartTime,
+					EndTime:      newWorkload.EndTime,
+					DownloadSize: prevWorkload.DownloadSize + newWorkload.DownloadSize,
+				}
+				in.Proofs.Extra.Cost += old.Proofs.Extra.Cost
+				in.Proofs.Extra.Count = old.Proofs.Extra.Count + 1
+			}
+			proofs[prevNodeId] = in
+		case <-s.submitChan:
+			keyInScheduler := make(map[string]string)
+			schedulerGroup := make(map[string][]*types.WorkloadReport)
+			for k, param := range proofs {
+				_, ok := schedulerGroup[param.SchedulerURL]
+				if !ok {
+					schedulerGroup[param.SchedulerURL] = make([]*types.WorkloadReport, 0)
+				}
+				proofs[k].Proofs.Workload.DownloadSpeed = int64(float64(param.Proofs.Workload.DownloadSize) * 1000 / float64(param.Proofs.Extra.Cost))
+				keyInScheduler[param.SchedulerURL] = param.SchedulerKey
+				schedulerGroup[param.SchedulerURL] = append(schedulerGroup[param.SchedulerURL], proofs[k].Proofs)
+			}
+
+			if s.opts.Verbose {
+				printReport(proofs)
+			}
+
+			var eg errgroup.Group
+			for url, paramList := range schedulerGroup {
+				if len(paramList) == 0 {
+					continue
+				}
+
+				eg.Go(func() error {
+					key := keyInScheduler[url]
+					data, err := encrypt(key, paramList)
+					if err != nil {
+						return errors.Errorf("encrypting proof failed: %v", err)
+					}
+
+					return s.SubmitProofOfWork(url, data)
+				})
+			}
+
+			if err := eg.Wait(); err != nil {
+				log.Errorf("submit proofs: %v", err)
+			}
+
+		}
+	}
 }

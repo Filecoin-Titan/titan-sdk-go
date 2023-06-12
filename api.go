@@ -10,13 +10,14 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/ipfs/go-ipfs-files"
 	ipld "github.com/ipfs/go-ipld-format"
+	logging "github.com/ipfs/go-log"
 	unixfile "github.com/ipfs/go-unixfs/file"
 	"github.com/pkg/errors"
 	"io"
 )
 
 type API interface {
-	// GetFile get a file from the Titan network.
+	// GetFile get a file from the titan network.
 	// The file is downloaded in chunks and assembled locally.
 	GetFile(ctx context.Context, cid string) (int64, io.ReadCloser, error)
 }
@@ -50,14 +51,30 @@ func New(opts ...config.Option) (*Client, error) {
 		c.dag = merkledag.NewDAGService(c.titan)
 	}
 
+	if options.Verbose {
+		lvl, err := logging.LevelFromString("debug")
+		if err != nil {
+			return nil, err
+		}
+		logging.SetAllLoggers(lvl)
+	}
+
 	_, err = s.Discover()
 	if err != nil {
-		return nil, err
+		return nil, errors.Errorf("discover nat: %v", err)
 	}
 
 	go c.notify.ListenEndOfFile(context.Background(), c.titan.EndOfFile)
 
 	return c, nil
+}
+
+func (c *Client) Close() error {
+	return c.titan.Close()
+}
+
+func (c *Client) GetTitanService() *titan.Service {
+	return c.titan
 }
 
 func (c *Client) GetFile(ctx context.Context, id string) (int64, io.ReadCloser, error) {
@@ -110,7 +127,6 @@ func (c *Client) getFileByRange(ctx context.Context, id string) (int64, io.ReadC
 
 	r := byteRange.New(c.titan,
 		c.config.RangeSize,
-		c.config.Concurrency,
 	)
 
 	return r.GetFile(ctx, cid)

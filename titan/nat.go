@@ -26,13 +26,13 @@ const (
 // Discover client-side NAT type discovery
 func (s *Service) Discover() (t types.NATType, e error) {
 	defer func() {
-		s.natType = t
+		s.mineNat = t
 		log.Debugf("My NAT type: %s", t)
 	}()
 
 	schedulers, err := s.GetSchedulers()
 	if err != nil {
-		return unknown, err
+		return unknown, errors.Errorf("get sechedulers: %v", err)
 	}
 
 	if len(schedulers) == 0 {
@@ -41,7 +41,7 @@ func (s *Service) Discover() (t types.NATType, e error) {
 
 	candidates, err := s.GetCandidates(schedulers[0])
 	if err != nil {
-		return unknown, err
+		return unknown, errors.Errorf("get candidates: %v", err)
 	}
 
 	if len(candidates) == 0 {
@@ -53,7 +53,7 @@ func (s *Service) Discover() (t types.NATType, e error) {
 	// Test I: sends an udp packet to primary candidates
 	publicAddrPrimary, err := s.GetPublicAddress(primaryCandidate)
 	if err != nil {
-		return udpBlock, err
+		return udpBlock, errors.Errorf("Test I: %v", err)
 	}
 
 	log.Debugf("PublicAddr: %s", publicAddrPrimary)
@@ -68,7 +68,7 @@ func (s *Service) Discover() (t types.NATType, e error) {
 	// Test II: sends an udp packet to secondary candidates
 	publicAddrSecondary, err := s.GetPublicAddress(secondaryCandidate)
 	if err != nil {
-		return unknown, err
+		return unknown, errors.Errorf("Test II: %v", err)
 	}
 
 	if publicAddrPrimary.Port != publicAddrSecondary.Port {
@@ -86,7 +86,7 @@ func (s *Service) Discover() (t types.NATType, e error) {
 			// Test III: sends a tcp packet to primaryCandidate from tertiary candidates
 			err = s.RequestCandidateToSendPackets(tertiaryCandidate, "tcp", publicAddrPrimary.String())
 			if err != nil {
-				return err
+				return errors.Errorf("Test III failed: candidate: %s, %v", tertiaryCandidate, err)
 			}
 
 			isOpenInternet = true
@@ -96,7 +96,7 @@ func (s *Service) Discover() (t types.NATType, e error) {
 			// Test IV: sends an udp packet to primaryCandidate from tertiary candidates
 			err = s.RequestCandidateToSendPackets(tertiaryCandidate, "udp", publicAddrPrimary.String())
 			if err != nil {
-				return err
+				return errors.Errorf("Test IV failed: candidate:%s %v", tertiaryCandidate, err)
 			}
 
 			isFullCone = true
@@ -106,7 +106,7 @@ func (s *Service) Discover() (t types.NATType, e error) {
 			// Test V: sends an udp packet to primaryCandidate from primary candidates
 			err = s.RequestCandidateToSendPackets(primaryCandidate, "udp", publicAddrPrimary.String())
 			if err != nil {
-				return err
+				return errors.Errorf("Test V failed: %v", err)
 			}
 
 			isRestricted = true
@@ -133,21 +133,26 @@ func (s *Service) Discover() (t types.NATType, e error) {
 	}
 }
 
-// filterAccessibleEdges filtering out the list of available edges to only include those that are accessible by the client
+// accessibleNodes filtering out the list of available edges to only include those that are accessible by the client
 // and added to the list of accessible accessibleEdges.
-func (s *Service) filterAccessibleEdges(ctx context.Context, edges []*types.Edge) error {
-	var wg sync.WaitGroup
+func (s *Service) accessibleNodes(ctx context.Context, edges []*types.Edge) (map[string]*types.Client, error) {
+	var (
+		lk      sync.Mutex
+		clients = make(map[string]*types.Client)
+		wg      sync.WaitGroup
+	)
+
+	wg.Add(len(edges))
 	for i := 0; i < len(edges); i++ {
-		if edges[i].GetNATType() == symmetric {
-			log.Warnf("A symmetric type device was found, but we haven't implemented it yet, so skip that for now.")
-			continue
-		}
-
-		wg.Add(1)
-
 		go func(edge *types.Edge) {
 			defer wg.Done()
-			client, err := s.determineEdgeClient(ctx, s.natType, edge)
+
+			if edge.GetNATType() == symmetric {
+				log.Warnf("A symmetric type device was found, but we haven't implemented it yet, so skip that for now.")
+				return
+			}
+
+			client, err := s.determineEdgeClient(ctx, s.mineNat, edge)
 			if err != nil {
 				log.Warnf("determine edge %s(%s) http client failed: %v", edge.NodeID, edge.Address, err)
 				return
@@ -159,18 +164,18 @@ func (s *Service) filterAccessibleEdges(ctx context.Context, edges []*types.Edge
 				return
 			}
 
-			s.clk.Lock()
-			s.accessibleEdges = append(s.accessibleEdges, edge)
-			s.clients[edge.NodeID] = client
-			s.clk.Unlock()
+			lk.Lock()
+			clients[edge.NodeID] = &types.Client{
+				Node:       edge,
+				HttpClient: client,
+			}
+			lk.Unlock()
 		}(edges[i])
 	}
 
 	wg.Wait()
 
-	log.Debugf("got accessible edge nodes: %d", len(s.clients))
-
-	return nil
+	return clients, nil
 }
 
 // determineEdgeClient determines that can be directly connected to using the default httpclient.
@@ -197,15 +202,15 @@ func (s *Service) determineEdgeClient(ctx context.Context, userNATType types.NAT
 	if edgeNATType == restricted || userNATType == restricted {
 		err := s.EstablishConnectionFromEdge(edge)
 		if err != nil {
-			return nil, errors.Errorf("request candidate to send packets: %v", err)
+			return nil, errors.Errorf("request candidate to send packets failed, edge: %s: err: %v", edge.Address, err)
 		}
 
-		conn, err := createConnection(ctx, s.conn, edge.Address)
+		client, err := newHttp3Client(ctx, s.conn, edge.Address, s.opts.Timeout)
 		if err != nil {
-			return nil, errors.Errorf("create connection: %v", err)
+			return nil, errors.Errorf("create new http3 client: %v", err)
 		}
 
-		return newHttpClient(conn, s.timeout), nil
+		return client, nil
 	}
 
 	// Check if the edge and the user both have a restricted port cone NAT type, then try to send packets to the edge and request the scheduler to do so as well
@@ -214,15 +219,15 @@ func (s *Service) determineEdgeClient(ctx context.Context, userNATType types.NAT
 
 		err := s.EstablishConnectionFromEdge(edge)
 		if err != nil {
-			return nil, errors.Errorf("request candidate to send packets: %v", err)
+			return nil, errors.Errorf("request candidate to send packets failed, edge: %s, err: %v", edge.Address, err)
 		}
 
-		conn, err := createConnection(ctx, s.conn, edge.Address)
+		client, err := newHttp3Client(ctx, s.conn, edge.Address, s.opts.Timeout)
 		if err != nil {
-			return nil, errors.Errorf("create connection: %v", err)
+			return nil, errors.Errorf("create new http3 client: %v", err)
 		}
 
-		return newHttpClient(conn, s.timeout), nil
+		return client, nil
 	}
 
 	if edgeNATType == symmetric || userNATType == symmetric {

@@ -38,6 +38,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}	
+	defer client.Close()
 	
 	cid := "QmQmbAk3PRdgLPwUDbrDdbiqP23VCVrF1Y5MVYrBXwGZHy"
 	_, reader, err := client.GetFile(context.Background(), cid)
