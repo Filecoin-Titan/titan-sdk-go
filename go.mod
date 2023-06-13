@@ -4,7 +4,6 @@ go 1.19
 
 require (
 	github.com/cheggaaa/pb v1.0.29
-	github.com/docker/go-units v0.5.0
 	github.com/eikenb/pipeat v0.0.0-20210730190139-06b3e6902001
 	github.com/google/uuid v1.3.0
 	github.com/gorilla/mux v1.8.0
@@ -19,7 +18,6 @@ require (
 	github.com/ipfs/go-merkledag v0.10.0
 	github.com/ipfs/go-unixfs v0.4.5
 	github.com/ipld/go-car/v2 v2.10.0
-	github.com/olekukonko/tablewriter v0.0.5
 	github.com/pkg/errors v0.9.1
 	github.com/quic-go/quic-go v0.33.0
 	golang.org/x/sync v0.1.0
@@ -65,6 +63,7 @@ require (
 	github.com/multiformats/go-multicodec v0.8.1 // indirect
 	github.com/multiformats/go-multihash v0.2.1 // indirect
 	github.com/multiformats/go-varint v0.0.7 // indirect
+	github.com/olekukonko/tablewriter v0.0.5 // indirect
 	github.com/onsi/ginkgo/v2 v2.5.1 // indirect
 	github.com/opentracing/opentracing-go v1.2.0 // indirect
 	github.com/petar/GoLLRB v0.0.0-20210522233825-ae3b015fd3e9 // indirect

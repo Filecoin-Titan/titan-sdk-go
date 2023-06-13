@@ -7,7 +7,6 @@ import (
 	"golang.org/x/sync/errgroup"
 	"net/http"
 	"sync"
-	"time"
 )
 
 const (
@@ -26,14 +25,9 @@ const (
 
 // Discover client-side NAT type discovery
 func (s *Service) Discover() (t types.NATType, e error) {
-	if s.userNat != types.NATUnknown && time.Now().Sub(s.lastNatT.Add(natTTLInterval)) < 0 {
-		return s.userNat, nil
-	}
-
 	defer func() {
-		s.userNat = t
-		s.lastNatT = time.Now()
-		log.Debugf("My NAT type: %s", s.userNat)
+		s.mineNat = t
+		log.Debugf("My NAT type: %s", t)
 	}()
 
 	schedulers, err := s.GetSchedulers()
@@ -139,9 +133,9 @@ func (s *Service) Discover() (t types.NATType, e error) {
 	}
 }
 
-// FilterAccessibleNodes filtering out the list of available edges to only include those that are accessible by the client
+// accessibleNodes filtering out the list of available edges to only include those that are accessible by the client
 // and added to the list of accessible accessibleEdges.
-func (s *Service) FilterAccessibleNodes(ctx context.Context, edges []*types.Edge) (map[string]*types.Client, error) {
+func (s *Service) accessibleNodes(ctx context.Context, edges []*types.Edge) (map[string]*types.Client, error) {
 	var (
 		lk      sync.Mutex
 		clients = make(map[string]*types.Client)
@@ -158,14 +152,13 @@ func (s *Service) FilterAccessibleNodes(ctx context.Context, edges []*types.Edge
 				return
 			}
 
-			client, err := s.determineEdgeClient(ctx, s.userNat, edge)
+			client, err := s.determineEdgeClient(ctx, s.mineNat, edge)
 			if err != nil {
 				log.Warnf("determine edge %s(%s) http client failed: %v", edge.NodeID, edge.Address, err)
 				return
 			}
 
-			// just send the packets to server and test the connection
-			err = s.Version(client, edge.Address)
+			err = s.SendPackets(client, edge.Address)
 			if err != nil {
 				log.Warnf("send packets to edge %s(%s) failed: %v", edge.NodeID, edge.Address, err)
 				return
@@ -198,22 +191,35 @@ func (s *Service) determineEdgeClient(ctx context.Context, userNATType types.NAT
 
 	// Check if the user has an open Internet NAT type, then try to establish a connection through NAT traversal
 	if userNATType == openInternet || userNATType == fullCone {
-		if err := s.NatPunching(edge); err != nil {
-			return nil, errors.Errorf("NAT punching via scheduler: %v", err)
+		if err := s.EstablishConnectionFromEdge(edge); err != nil {
+			return nil, errors.Errorf("establish connection from edge: %v", err)
 		}
 
 		return s.httpClient, nil
 	}
 
 	// Check if the edge and the user both have a restricted cone NAT type, then request the scheduler to connect to the edge node
-	// Check if the edge and the user both have a restricted port cone NAT type, then try to send packets to the edge and request the scheduler to do so as well
-	if edgeNATType == restricted || userNATType == restricted || edgeNATType == portRestricted || userNATType == portRestricted {
-		// just send the packets to server, we don't need a response
-		go s.Version(s.httpClient, edge.Address)
-
-		err := s.NatPunching(edge)
+	if edgeNATType == restricted || userNATType == restricted {
+		err := s.EstablishConnectionFromEdge(edge)
 		if err != nil {
-			return nil, errors.Errorf("NAT punching via scheduler, edge: %s, err: %v", edge.Address, err)
+			return nil, errors.Errorf("request candidate to send packets failed, edge: %s: err: %v", edge.Address, err)
+		}
+
+		client, err := newHttp3Client(ctx, s.conn, edge.Address, s.opts.Timeout)
+		if err != nil {
+			return nil, errors.Errorf("create new http3 client: %v", err)
+		}
+
+		return client, nil
+	}
+
+	// Check if the edge and the user both have a restricted port cone NAT type, then try to send packets to the edge and request the scheduler to do so as well
+	if edgeNATType == portRestricted && userNATType == portRestricted {
+		go s.SendPackets(s.httpClient, edge.Address)
+
+		err := s.EstablishConnectionFromEdge(edge)
+		if err != nil {
+			return nil, errors.Errorf("request candidate to send packets failed, edge: %s, err: %v", edge.Address, err)
 		}
 
 		client, err := newHttp3Client(ctx, s.conn, edge.Address, s.opts.Timeout)
@@ -226,8 +232,8 @@ func (s *Service) determineEdgeClient(ctx context.Context, userNATType types.NAT
 
 	if edgeNATType == symmetric || userNATType == symmetric {
 		// TODO: request the scheduler to send packets and guess the port
-		return nil, errors.Errorf("symmetric unimplemented")
+		return nil, errors.Errorf("symmetric NAT unimplemented")
 	}
 
-	return nil, errors.Errorf("unknown scenarios")
+	return nil, errors.Errorf("unknown NAT type")
 }
