@@ -31,17 +31,17 @@ func New(service *titan.Service, size int64) *Range {
 }
 
 func (r *Range) GetFile(ctx context.Context, cid cid.Cid) (int64, io.ReadCloser, error) {
-	directEdges, natTraversalEdges, err := r.titan.GroupByEdges(ctx, cid)
+	directConnEdges, natTraversalEdges, err := r.titan.GroupByEdges(ctx, cid)
 	if err != nil {
 		return 0, nil, err
 	}
 
-	fileSize, err := r.getFileSize(ctx, cid, directEdges)
+	workerChan, err := r.makeWorkerChan(ctx, directConnEdges, natTraversalEdges)
 	if err != nil {
 		return 0, nil, err
 	}
 
-	workerChan, err := r.makeWorkerChan(ctx, directEdges, natTraversalEdges)
+	fileSize, err := r.getFileSize(ctx, cid, directConnEdges, workerChan)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -69,12 +69,30 @@ func (r *Range) GetFile(ctx context.Context, cid cid.Cid) (int64, io.ReadCloser,
 	return fileSize, reader, nil
 }
 
-func (r *Range) getFileSize(ctx context.Context, cid cid.Cid, edges []*types.Edge) (int64, error) {
+func (r *Range) getFileSize(ctx context.Context, cid cid.Cid, edges []*types.Edge, workerChan chan worker) (int64, error) {
 	var (
 		start    int64
 		size     int64 = 1 << 10 // 1 KiB
 		fileSize int64
 	)
+
+	if len(edges) == 0 {
+		for {
+			select {
+			case w := <-workerChan:
+				fs, _, err := r.titan.GetRange(ctx, w.c, cid, start, size)
+				if err != nil {
+					workerChan <- w
+					log.Errorf("get range failed: %v", err)
+					continue
+				}
+				workerChan <- w
+				return fs, nil
+			case <-ctx.Done():
+				return 0, nil
+			}
+		}
+	}
 
 	for _, edge := range edges {
 		client := &types.Client{
