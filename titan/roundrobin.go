@@ -6,11 +6,11 @@ import (
 	"sync"
 )
 
-type Strategy func(edges []*types.Edge) func() *types.Edge
+type Strategy func(edges []*types.Client) func() *types.Client
 
 // roundRobinSelector is a round-robin strategy algorithm for node selection.
-func roundRobinSelector(edges []*types.Edge) func() *types.Edge {
-	var nodes []*types.Edge
+func roundRobinSelector(edges []*types.Client) func() *types.Client {
+	var nodes []*types.Client
 
 	for _, node := range edges {
 		nodes = append(nodes, node)
@@ -19,10 +19,9 @@ func roundRobinSelector(edges []*types.Edge) func() *types.Edge {
 	var i = rand.Intn(100)
 	var mtx sync.Mutex
 
-	return func() *types.Edge {
-		if len(nodes) == 0 {
-			return nil
-		}
+	return func() *types.Client {
+		i++
+
 		mtx.Lock()
 		node := nodes[i%len(nodes)]
 		mtx.Unlock()

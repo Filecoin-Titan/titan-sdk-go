@@ -25,7 +25,6 @@ import (
 	"net/url"
 	"os"
 	"path"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,29 +38,32 @@ var (
 	namespace = "ipfs"
 )
 
+const (
+	natTTLInterval = 2 * time.Hour
+)
+
 var log = logging.Logger("service")
 
 type Service struct {
 	opts       config.Config
 	httpClient *http.Client
 	conn       net.PacketConn
-	mineNat    types.NATType
+	userNat    types.NATType
+	lastNatT   time.Time
 	ids        sync.Map
 	counter    atomic.Int32
 
 	prepareChan chan *types.ProofParam
 	submitChan  chan struct{}
 
-	clk     sync.Mutex
-	clients map[string]*types.Client
-	nodes   []*types.Edge
+	nodes []*types.Client
 }
 
 type params []interface{}
 
 func New(options config.Config) (*Service, error) {
 	if options.Address == "" {
-		return nil, errors.Errorf("address or Token is empty")
+		return nil, errors.Errorf("address is empty")
 	}
 
 	conn, err := net.ListenPacket("udp4", options.ListenAddr)
@@ -73,8 +75,7 @@ func New(options config.Config) (*Service, error) {
 		opts:        options,
 		httpClient:  defaultHttpClient(conn, options.Timeout),
 		conn:        conn,
-		clients:     make(map[string]*types.Client),
-		nodes:       make([]*types.Edge, 0),
+		nodes:       make([]*types.Client, 0),
 		prepareChan: make(chan *types.ProofParam, 1),
 		submitChan:  make(chan struct{}, 0),
 	}
@@ -125,27 +126,29 @@ func serverTCP(conn net.PacketConn) {
 	srv.Serve(ln)
 }
 
-func (s *Service) GetClient(nodeID string) *http.Client {
-	s.clk.Lock()
-	defer s.clk.Unlock()
-
-	return s.clients[nodeID].HttpClient
+func (s *Service) GetDefaultClient() *http.Client {
+	return s.httpClient
 }
 
 // GetBlock retrieves a raw block from titan http gateway
 func (s *Service) GetBlock(ctx context.Context, cid cid.Cid) (blocks.Block, error) {
-	err := s.loadEdges(ctx, cid)
+	_, err := s.GetAccessibleEdges(ctx, cid)
 	if err != nil {
 		return nil, err
 	}
 
-	edge, client, err := s.selectEdge()
+	if len(s.nodes) == 0 {
+		return nil, errors.Errorf("no edge node found for cid: %s", cid.String())
+	}
+
+	edge, err := s.selectEdge()
 	if err != nil {
+		log.Warnf("selectEdge: %v", err)
 		return nil, err
 	}
 
 	start := time.Now()
-	size, data, err := PullData(ctx, client, edge, cid.String(), formatRaw, nil)
+	size, data, err := PullData(ctx, edge.HttpClient, edge.Node, cid.String(), formatRaw, nil)
 	if err != nil {
 		return nil, errors.Errorf("post request failed: %v", err)
 	}
@@ -155,7 +158,7 @@ func (s *Service) GetBlock(ctx context.Context, cid cid.Cid) (blocks.Block, erro
 		tStart: start.UnixMilli(),
 		tEnd:   time.Now().UnixMilli(),
 		size:   size,
-		edge:   edge,
+		edge:   edge.Node,
 	}
 
 	if err = s.generateProofOfWork(proofs); err != nil {
@@ -165,56 +168,17 @@ func (s *Service) GetBlock(ctx context.Context, cid cid.Cid) (blocks.Block, erro
 	return blocks.NewBlock(data), nil
 }
 
-func (s *Service) selectEdge() (*types.Edge, *http.Client, error) {
-	if len(s.clients) == 0 {
-		return nil, nil, errors.Errorf("no accessible node")
+func (s *Service) selectEdge() (*types.Client, error) {
+	if len(s.nodes) == 0 {
+		return nil, errors.Errorf("no accessible node")
 	}
 
-	luckyEdge := roundRobinSelector(s.filterBadNodes())()
+	luckyEdge := roundRobinSelector(s.nodes)()
 	if luckyEdge == nil {
-		return nil, nil, errors.Errorf("unavaliable node")
+		return nil, errors.Errorf("unavaliable node")
 	}
 
-	return luckyEdge, s.GetClient(luckyEdge.NodeID), nil
-}
-
-func (s *Service) filterBadNodes() []*types.Edge {
-	s.counter.Add(1)
-
-	counter := int(s.counter.Load())
-	cutoff := counter % len(s.clients)
-
-	if cutoff == 0 {
-		var clients []*types.Client
-		for _, client := range s.clients {
-			if client.Weight <= 0 {
-				continue
-			}
-
-			clients = append(clients, client)
-		}
-
-		sort.Slice(clients, func(i, j int) bool {
-			return clients[i].Weight > clients[j].Weight
-		})
-
-		var nodes []*types.Edge
-		for _, client := range clients {
-			nodes = append(nodes, client.Node)
-		}
-
-		s.nodes = nodes
-	}
-
-	round := counter / len(s.nodes)
-
-	half := len(s.nodes) / 2
-	end := len(s.nodes) - round
-	if end < half {
-		end = half
-	}
-
-	return s.nodes[:end]
+	return luckyEdge, nil
 }
 
 func PullData(ctx context.Context, client *http.Client, edge *types.Edge, cid string, format string, requestHeader http.Header) (int64, []byte, error) {
@@ -262,57 +226,50 @@ func getFileSizeFromContentRange(contentRange string) (int64, error) {
 	return strconv.ParseInt(subs[1], 10, 64)
 }
 
-// loadEdges retrieves all accessible edge nodes of a file
-func (s *Service) loadEdges(ctx context.Context, cid cid.Cid) error {
-	_, ok := s.ids.Load(cid.String())
-	if ok {
-		return nil
-	}
-
-	edges, err := s.GetAccessibleEdges(ctx, cid)
-	if err != nil {
-		return err
-	}
-
-	if len(edges) == 0 {
-		return errors.Errorf("no edge node found for cid: %s", cid.String())
-	}
-
-	s.ids.Store(cid.String(), true)
-
-	return nil
-}
-
 func (s *Service) GetAccessibleEdges(ctx context.Context, cid cid.Cid) (map[string]*types.Client, error) {
+	_, err := s.Discover()
+	if err != nil {
+		return nil, err
+	}
+
 	all, err := s.GetEdgeNodesByFile(cid)
 	if err != nil {
 		return nil, err
 	}
 
-	clients, err := s.accessibleNodes(ctx, all)
+	clients, err := s.FilterAccessibleNodes(ctx, all)
 	if err != nil {
 		return nil, err
 	}
 
-	if err = s.updateClients(clients); err != nil {
-		return nil, err
+	for _, client := range clients {
+		s.nodes = append(s.nodes, client)
 	}
 
 	return clients, nil
 }
 
-func (s *Service) updateClients(clients map[string]*types.Client) error {
-	nodes := make([]*types.Edge, 0, len(clients))
-	for _, c := range clients {
-		nodes = append(nodes, c.Node)
+func (s *Service) GroupByEdges(ctx context.Context, cid cid.Cid) ([]*types.Edge, []*types.Edge, error) {
+	var directlyConnEdges, natTraversalEdges []*types.Edge
+
+	all, err := s.GetEdgeNodesByFile(cid)
+	if err != nil {
+		return nil, nil, err
 	}
 
-	s.clk.Lock()
-	s.clients = clients
-	s.nodes = nodes
-	s.clk.Unlock()
+	if len(all) == 0 {
+		return nil, nil, errors.New("asset not found")
+	}
 
-	return nil
+	for _, edge := range all {
+		if edge.GetNATType() == openInternet || edge.GetNATType() == fullCone {
+			directlyConnEdges = append(directlyConnEdges, edge)
+			continue
+		}
+		natTraversalEdges = append(natTraversalEdges, edge)
+	}
+
+	return directlyConnEdges, natTraversalEdges, nil
 }
 
 // GetRange retrieves specific byte ranges of UnixFS files and raw blocks.
@@ -338,11 +295,6 @@ func (s *Service) GetRange(ctx context.Context, c *types.Client, cid cid.Cid, st
 	if err = s.generateProofOfWork(proofs); err != nil {
 		return 0, nil, errors.Errorf("generate proof of work failed: %v", err)
 	}
-
-	speed := len(data) / int(proofs.tEnd-proofs.tStart)
-	s.clk.Lock()
-	s.clients[c.Node.NodeID].Weight = speed / 1000
-	s.clk.Unlock()
 
 	return size, data, nil
 }
@@ -530,8 +482,8 @@ func (s *Service) RequestCandidateToSendPackets(remoteAddr string, network, url 
 	return err
 }
 
-// EstablishConnectionFromEdge creates a connection from edge node side for the application though the scheduler
-func (s *Service) EstablishConnectionFromEdge(edge *types.Edge) error {
+// NatPunching creates a connection from edge node side for the application via the scheduler
+func (s *Service) NatPunching(edge *types.Edge) error {
 	serializedParams, err := json.Marshal(params{edge.ToNatPunchReq()})
 	if err != nil {
 		return errors.Errorf("marshaling params failed: %v", err)
@@ -546,14 +498,14 @@ func (s *Service) EstablishConnectionFromEdge(edge *types.Edge) error {
 
 	_, err = request.PostJsonRPC(s.httpClient, edge.SchedulerURL, req, nil)
 	if err != nil {
-		return errors.Errorf("establish connection from edge failed: %v", err)
+		return errors.Errorf("invoke titan.NatPunch: %v", err)
 	}
 
 	return err
 }
 
-// SendPackets sends packet to the edge node
-func (s *Service) SendPackets(client *http.Client, remoteAddr string) error {
+// Version get titan server version
+func (s *Service) Version(client *http.Client, remoteAddr string) error {
 	req := request.Request{
 		Jsonrpc: "2.0",
 		ID:      "1",

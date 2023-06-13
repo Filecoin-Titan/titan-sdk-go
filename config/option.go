@@ -1,7 +1,6 @@
 package config
 
 import (
-	"net/http"
 	"time"
 )
 
@@ -25,10 +24,9 @@ type Config struct {
 	ListenAddr string
 	Address    string
 	Token      string
-	HttpClient *http.Client
 	Timeout    time.Duration
 	Mode       TraversalMode
-	RangeSize  int64 // for range mode
+	RangeSize  int64
 	Verbose    bool
 }
 
@@ -38,7 +36,7 @@ type Option func(opts *Config)
 // DefaultOption returns a default set of options.
 func DefaultOption() Config {
 	return Config{
-		Mode:       TraversalModeDFS,
+		Mode:       TraversalModeRange,
 		ListenAddr: defaultListenAddr,
 		RangeSize:  defaultRangeSize,
 		Timeout:    5 * time.Second,
@@ -57,13 +55,6 @@ func AddressOption(address string) Option {
 func TokenOption(token string) Option {
 	return func(opts *Config) {
 		opts.Token = token
-	}
-}
-
-// Http3ClientOption set HTTP/3 client, ONLY support HTTP/3 protocol
-func Http3ClientOption(client *http.Client) Option {
-	return func(opts *Config) {
-		opts.HttpClient = client
 	}
 }
 
