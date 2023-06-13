@@ -59,11 +59,6 @@ func New(opts ...config.Option) (*Client, error) {
 		logging.SetAllLoggers(lvl)
 	}
 
-	_, err = s.Discover()
-	if err != nil {
-		return nil, errors.Errorf("discover nat: %v", err)
-	}
-
 	go c.notify.ListenEndOfFile(context.Background(), c.titan.EndOfFile)
 
 	return c, nil
