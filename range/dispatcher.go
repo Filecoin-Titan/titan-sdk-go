@@ -23,6 +23,7 @@ type dispatcher struct {
 	titan     *titan.Service
 	writer    *pipeat.PipeWriterAt
 	reader    *pipeat.PipeReaderAt
+	clients   map[string]*types.Client
 	backoff   *backoff
 }
 
@@ -65,7 +66,11 @@ func (b *backoff) next(attempt int) time.Duration {
 	return delay
 }
 
-func (d *dispatcher) generateJobs() {
+func (d *dispatcher) initialization() {
+	for _, client := range d.clients {
+		d.workers <- worker{c: client}
+	}
+
 	count := int64(math.Ceil(float64(d.fileSize) / float64(d.rangeSize)))
 	for i := int64(0); i < count; i++ {
 		start := i * d.rangeSize
@@ -75,18 +80,16 @@ func (d *dispatcher) generateJobs() {
 			end = d.fileSize
 		}
 
-		newJob := &job{
+		d.todos.Push(&job{
 			index: int(i),
 			start: start,
 			end:   end,
-		}
-
-		d.todos.Push(newJob)
+		})
 	}
 }
 
 func (d *dispatcher) run(ctx context.Context) {
-	d.generateJobs()
+	d.initialization()
 	d.writeData(ctx)
 
 	var (
