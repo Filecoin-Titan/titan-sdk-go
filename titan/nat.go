@@ -191,7 +191,11 @@ func (s *Service) determineEdgeClient(ctx context.Context, userNATType types.NAT
 
 	// Check if the user has an open Internet NAT type, then try to establish a connection through NAT traversal
 	if userNATType == openInternet || userNATType == fullCone {
+<<<<<<< Updated upstream
 		if err := s.EstablishConnectionFromEdge(edge); err != nil {
+=======
+		if err := s.NatPunching(edge); err != nil {
+>>>>>>> Stashed changes
 			return nil, errors.Errorf("establish connection from edge: %v", err)
 		}
 
@@ -200,6 +204,7 @@ func (s *Service) determineEdgeClient(ctx context.Context, userNATType types.NAT
 
 	// Check if the edge and the user both have a restricted cone NAT type, then request the scheduler to connect to the edge node
 	if edgeNATType == restricted || userNATType == restricted {
+<<<<<<< Updated upstream
 		err := s.EstablishConnectionFromEdge(edge)
 		if err != nil {
 			return nil, errors.Errorf("request candidate to send packets failed, edge: %s: err: %v", edge.Address, err)
@@ -219,6 +224,27 @@ func (s *Service) determineEdgeClient(ctx context.Context, userNATType types.NAT
 
 		err := s.EstablishConnectionFromEdge(edge)
 		if err != nil {
+=======
+		err := s.NatPunching(edge)
+		if err != nil {
+			return nil, errors.Errorf("request candidate to send packets failed, edge: %s: err: %v", edge.Address, err)
+		}
+
+		client, err := newHttp3Client(ctx, s.conn, edge.Address, s.opts.Timeout)
+		if err != nil {
+			return nil, errors.Errorf("create new http3 client: %v", err)
+		}
+
+		return client, nil
+	}
+
+	// Check if the edge and the user both have a restricted port cone NAT type, then try to send packets to the edge and request the scheduler to do so as well
+	if edgeNATType == portRestricted && userNATType == portRestricted {
+		go s.Version(s.httpClient, edge.Address)
+
+		err := s.NatPunching(edge)
+		if err != nil {
+>>>>>>> Stashed changes
 			return nil, errors.Errorf("request candidate to send packets failed, edge: %s, err: %v", edge.Address, err)
 		}
 
